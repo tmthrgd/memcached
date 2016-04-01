@@ -248,6 +248,9 @@ static void settings_init(void) {
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
     settings.crawls_persleep = 1000;
+#ifdef SO_REUSEPORT
+    settings.reuseport = false;
+#endif
 }
 
 /*
@@ -4112,7 +4115,22 @@ static void drive_machine(conn *c) {
                 STATS_LOCK();
                 stats.rejected_conns++;
                 STATS_UNLOCK();
-            } else {
+            }
+#ifdef SO_REUSEPORT
+            else if (settings.reuseport) {
+                conn *nc = conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                   DATA_BUFFER_SIZE, tcp_transport, c->thread->base);
+                if (nc == NULL) {
+                    if (settings.verbose > 0) {
+                        fprintf(stderr, "Can't listen for events on fd %d\n", sfd);
+                    }
+                    close(sfd);
+                } else {
+                    nc->thread = c->thread;
+                }
+            }
+#endif
+            else {
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      DATA_BUFFER_SIZE, tcp_transport);
             }
@@ -4478,6 +4496,9 @@ static int server_socket(const char *interface,
     int error;
     int success = 0;
     int flags =1;
+#ifdef SO_REUSEPORT
+    int thd = 0;
+#endif
 
     hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
 
@@ -4496,6 +4517,8 @@ static int server_socket(const char *interface,
 
     for (next= ai; next; next= next->ai_next) {
         conn *listen_conn_add;
+
+next_socket:
         if ((sfd = new_socket(next)) == -1) {
             /* getaddrinfo can return "junk" addresses,
              * we make sure at least one works before erroring.
@@ -4536,6 +4559,14 @@ static int server_socket(const char *interface,
                 perror("setsockopt");
         }
 
+#ifdef SO_REUSEPORT
+        if (settings.reuseport) {
+            error = setsockopt(sfd, SOL_SOCKET, SO_REUSEPORT, (void *)&flags, sizeof(flags));
+            if (error != 0)
+                perror("setsockopt");
+        }
+#endif
+
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             if (errno != EADDRINUSE) {
                 perror("bind()");
@@ -4575,6 +4606,41 @@ static int server_socket(const char *interface,
             }
         }
 
+#ifdef SO_REUSEPORT
+        if (settings.reuseport && IS_UDP(transport)) {
+            /* Allocate one UDP socket per worker thread.
+             *
+             * The dispatch code round-robins new connection requests
+             * among threads, so this is guaranteed to assign one
+             * socket to each thread.
+             */
+            dispatch_conn_new(sfd, conn_read,
+                              EV_READ | EV_PERSIST,
+                              UDP_READ_BUFFER_SIZE, transport);
+
+            if (thd++ < settings.num_threads_per_udp) {
+                goto next_socket;
+            }
+
+            thd = 0;
+        } else if (settings.reuseport && !IS_UDP(transport)) {
+            /* Allocate one TCP socket per worker thread.
+             *
+             * The dispatch code round-robins new connection requests
+             * among threads, so this is guaranteed to assign one
+             * socket to each thread.
+             */
+            dispatch_conn_new(sfd, conn_listening,
+                              EV_READ | EV_PERSIST,
+                              DATA_BUFFER_SIZE, transport);
+
+            if (thd++ < settings.num_threads_per_udp) {
+                goto next_socket;
+            }
+
+            thd = 0;
+        } else
+#endif
         if (IS_UDP(transport)) {
             int c;
 
@@ -4890,6 +4956,9 @@ static void usage(void) {
            "                (requires lru_maintainer)\n"
            "              - expirezero_does_not_evict: Items set to not expire, will not evict.\n"
            "                (requires lru_maintainer)\n"
+#ifdef SO_REUSEPORT
+           "              - (EXPERIMENTAL) reuseport: Set SO_REUSEPORT and spawn one socket per thread.\n"
+#endif
            );
     return;
 }
@@ -5138,7 +5207,8 @@ int main (int argc, char **argv) {
         LRU_MAINTAINER,
         HOT_LRU_PCT,
         WARM_LRU_PCT,
-        NOEXP_NOEVICT
+        NOEXP_NOEVICT,
+        REUSEPORT
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -5154,6 +5224,7 @@ int main (int argc, char **argv) {
         [HOT_LRU_PCT] = "hot_lru_pct",
         [WARM_LRU_PCT] = "warm_lru_pct",
         [NOEXP_NOEVICT] = "expirezero_does_not_evict",
+        [REUSEPORT] = "reuseport",
         NULL
     };
 
@@ -5517,6 +5588,14 @@ int main (int argc, char **argv) {
                 break;
             case NOEXP_NOEVICT:
                 settings.expirezero_does_not_evict = true;
+                break;
+            case REUSEPORT:
+#ifdef SO_REUSEPORT
+                settings.reuseport = true;
+#else
+                fprintf(stderr, "This server is not built with SO_REUSEPORT support.\n");
+                exit(EX_USAGE);
+#endif
                 break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);

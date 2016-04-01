@@ -344,6 +344,9 @@ struct settings {
     int warm_lru_pct; /* percentage of slab space for WARM_LRU */
     int crawls_persleep; /* Number of LRU crawls to run before sleeping */
     bool expirezero_does_not_evict; /* exptime == 0 goes into NOEXP_LRU */
+#ifdef SO_REUSEPORT
+    bool reuseport; /* set SO_REUSEPORT on socket and open one socket per thread */
+#endif
 };
 
 extern struct stats stats;
